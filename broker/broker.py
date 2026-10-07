@@ -411,12 +411,21 @@ class Broker:
         self._queue.sort(key=lambda q: q.seq)
 
     def _apply_record(self, rec: dict) -> None:
-        """Replay a WAL record as a fact; never re-runs scheduling."""
+        """Replay a WAL record as a fact; never re-runs scheduling.
+
+        Fully idempotent: a crash mid-snapshot can leave the snapshot and an
+        untruncated WAL on disk together, so records already covered by the
+        snapshot (or otherwise duplicated) may be replayed again. Applying
+        the same record any number of times must equal applying it once.
+        """
         op = rec["op"]
         if op == "add_node":
-            self._nodes[rec["node_id"]] = Node(
-                node_id=rec["node_id"], capacity=rec["capacity"],
-                last_heartbeat=rec["at"])
+            # skip if the node is already known (snapshot or earlier record):
+            # recreating it would wipe its state and slot accounting
+            if rec["node_id"] not in self._nodes:
+                self._nodes[rec["node_id"]] = Node(
+                    node_id=rec["node_id"], capacity=rec["capacity"],
+                    last_heartbeat=rec["at"])
         elif op == "heartbeat":
             node = self._nodes.get(rec["node_id"])
             if node is not None:
@@ -431,6 +440,11 @@ class Broker:
                 node.state = NodeState.OFFLINE
         elif op == "session_admitted":
             self._seq = max(self._seq, rec["seq"])
+            # skip if the session is already known: re-creating it would
+            # clobber newer state (e.g. revive an ENDED session or roll back
+            # a renewed lease already captured by the snapshot)
+            if rec["session_id"] in self._sessions:
+                return
             session = Session(session_id=rec["session_id"],
                               player_id=rec["player_id"],
                               node_id=rec["node_id"],
@@ -462,6 +476,11 @@ class Broker:
                 session.lease_expires_at = rec["lease_expires_at"]
         elif op == "request_enqueued":
             self._seq = max(self._seq, rec["seq"])
+            # skip if this request is already waiting: a duplicated record
+            # (overlap between snapshot and untruncated WAL) must not put
+            # the same request into the queue twice
+            if any(q.request_id == rec["request_id"] for q in self._queue):
+                return
             self._queue.append(QueuedRequest(request_id=rec["request_id"],
                                              player_id=rec["player_id"],
                                              enqueued_at=rec["at"],

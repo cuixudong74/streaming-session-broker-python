@@ -11,7 +11,11 @@ Recovery rules:
 - a torn / half-written trailing record (bad checksum or bad JSON) is
   discarded instead of being treated as complete state;
 - snapshot writes go through a temp file + rename so a crash mid-write
-  never leaves a half snapshot that could be mistaken for a complete one.
+  never leaves a half snapshot that could be mistaken for a complete one;
+- a crash between the snapshot rename and the WAL truncation leaves the
+  new snapshot next to the old, fully-covered WAL; replaying those
+  overlapping records is safe because record application (see
+  ``Broker._apply_record``) is idempotent.
 """
 from __future__ import annotations
 
@@ -58,9 +62,22 @@ class WalStore:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, self._snapshot)
+        self._fsync_dir()
         # WAL records are now covered by the snapshot; start a fresh WAL.
         self._fh.close()
         self._fh = open(self._wal, "w", encoding="utf-8")
+        # make the truncation itself durable, narrowing the crash window in
+        # which snapshot and pre-truncation WAL coexist on disk (recovery is
+        # idempotent anyway, so that overlap is safe even if it happens)
+        self._fh.flush()
+        os.fsync(self._fh.fileno())
+
+    def _fsync_dir(self) -> None:
+        fd = os.open(self._path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
     def recover(self) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
         """Return (snapshot_or_None, valid_records_after_snapshot)."""
