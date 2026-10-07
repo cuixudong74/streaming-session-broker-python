@@ -14,7 +14,11 @@ Design notes
   frees up, so no request can be starved by later arrivals jumping ahead.
 - Durability: every mutation is appended to the WAL *before* being
   applied. Recovery loads the snapshot then replays WAL records as facts
-  (never re-running scheduling), so nothing is re-placed or lost.
+  (never re-running scheduling), so nothing is re-placed or lost. Replay
+  is idempotent per record, so a crash between the snapshot rename and
+  the WAL truncate (which leaves records the snapshot already covers)
+  cannot duplicate queue entries, revive ended sessions, or
+  double-count slots.
 """
 from __future__ import annotations
 
@@ -411,19 +415,34 @@ class Broker:
         self._queue.sort(key=lambda q: q.seq)
 
     def _apply_record(self, rec: dict) -> None:
-        """Replay a WAL record as a fact; never re-runs scheduling."""
+        """Replay a WAL record as a fact; never re-runs scheduling.
+
+        Every branch is *idempotent*: a record whose effect is already
+        reflected in the current state (exact duplicate, or an older record
+        overlapping state the snapshot already covers) is a no-op, so
+        replaying the same record any number of times yields exactly the
+        same state as replaying it once. This is what makes recovery safe
+        when a crash happens between the snapshot rename and the WAL
+        truncate, leaving records that the snapshot already covers."""
         op = rec["op"]
         if op == "add_node":
-            self._nodes[rec["node_id"]] = Node(
-                node_id=rec["node_id"], capacity=rec["capacity"],
-                last_heartbeat=rec["at"])
+            node = self._nodes.get(rec["node_id"])
+            if node is None:
+                self._nodes[rec["node_id"]] = Node(
+                    node_id=rec["node_id"], capacity=rec["capacity"],
+                    last_heartbeat=rec["at"])
+            else:
+                # already known: never reset state/sessions, never regress
+                node.last_heartbeat = max(node.last_heartbeat, rec["at"])
         elif op == "heartbeat":
             node = self._nodes.get(rec["node_id"])
             if node is not None:
-                node.last_heartbeat = rec["at"]
+                # monotonic: an older overlapping record must not regress
+                node.last_heartbeat = max(node.last_heartbeat, rec["at"])
         elif op == "node_draining":
             node = self._nodes.get(rec["node_id"])
-            if node is not None:
+            if node is not None and node.state is NodeState.ACTIVE:
+                # OFFLINE is terminal; a stale duplicate must not regress it
                 node.state = NodeState.DRAINING
         elif op == "node_offline":
             node = self._nodes.get(rec["node_id"])
@@ -431,6 +450,10 @@ class Broker:
                 node.state = NodeState.OFFLINE
         elif op == "session_admitted":
             self._seq = max(self._seq, rec["seq"])
+            if rec["session_id"] in self._sessions:
+                # already admitted (or already ended): never revive, never
+                # double-count the slot
+                return
             session = Session(session_id=rec["session_id"],
                               player_id=rec["player_id"],
                               node_id=rec["node_id"],
@@ -447,7 +470,11 @@ class Broker:
                                       rec["ended_at"])
         elif op == "session_migrated":
             session = self._sessions.get(rec["session_id"])
-            if session is not None and session.state is SessionState.ACTIVE:
+            if (session is not None
+                    and session.state is SessionState.ACTIVE
+                    and session.node_id == rec["from_node"]):
+                # only apply if the session is still on the source node;
+                # a duplicate/overlapping record finds it already moved
                 old = self._nodes.get(rec["from_node"])
                 if old is not None:
                     old.sessions.discard(session.session_id)
@@ -455,13 +482,20 @@ class Broker:
                 if new is not None:
                     new.sessions.add(session.session_id)
                 session.node_id = rec["to_node"]
-                session.lease_expires_at = rec["lease_expires_at"]
+                session.lease_expires_at = max(session.lease_expires_at,
+                                               rec["lease_expires_at"])
         elif op == "lease_renewed":
             session = self._sessions.get(rec["session_id"])
             if session is not None:
-                session.lease_expires_at = rec["lease_expires_at"]
+                # monotonic: an older overlapping record must not shorten
+                session.lease_expires_at = max(session.lease_expires_at,
+                                               rec["lease_expires_at"])
         elif op == "request_enqueued":
             self._seq = max(self._seq, rec["seq"])
+            if any(q.request_id == rec["request_id"] for q in self._queue):
+                # already waiting (snapshot or earlier record): a request
+                # may appear in the queue at most once
+                return
             self._queue.append(QueuedRequest(request_id=rec["request_id"],
                                              player_id=rec["player_id"],
                                              enqueued_at=rec["at"],

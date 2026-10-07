@@ -11,7 +11,12 @@ Recovery rules:
 - a torn / half-written trailing record (bad checksum or bad JSON) is
   discarded instead of being treated as complete state;
 - snapshot writes go through a temp file + rename so a crash mid-write
-  never leaves a half snapshot that could be mistaken for a complete one.
+  never leaves a half snapshot that could be mistaken for a complete one;
+- the snapshot rename and the WAL truncate are *not* atomic: a crash
+  between them leaves WAL records that the new snapshot already covers
+  (duplicated / overlapping history). Consumers must therefore apply
+  records idempotently — replaying a record whose effect is already
+  reflected in the state must be a no-op (see ``Broker._apply_record``).
 """
 from __future__ import annotations
 
